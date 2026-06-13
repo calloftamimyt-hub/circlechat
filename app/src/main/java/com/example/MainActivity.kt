@@ -32,9 +32,23 @@ class MainActivity : ComponentActivity() {
       lateinit var appContext: android.content.Context
   }
 
+  private lateinit var viewModel: ChatViewModel
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     appContext = this.applicationContext
+    
+    // Add flags for Call Full Screen Intents
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
+    } else {
+        window.addFlags(
+            android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+            android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+        )
+    }
+    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
     val permissionsToRequest = mutableListOf(
         Manifest.permission.CAMERA,
@@ -52,10 +66,14 @@ class MainActivity : ComponentActivity() {
         ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 101)
     }
 
+    viewModel = androidx.lifecycle.ViewModelProvider(this)[ChatViewModel::class.java]
+
+    // Handle initial intent
+    viewModel.handleIntent(intent)
+
     enableEdgeToEdge()
     setContent {
       MyApplicationTheme(dynamicColor = false) { // enforce our custom rich theme styling
-        val viewModel: ChatViewModel = viewModel()
         
         val activeContactId by viewModel.activeContactId.collectAsStateWithLifecycle()
         val callState by viewModel.callState.collectAsStateWithLifecycle()
@@ -93,9 +111,11 @@ class MainActivity : ComponentActivity() {
         )
       }
 
+              val isMinimized by viewModel.isVideoCallMinimized.collectAsStateWithLifecycle()
+
               // Fullscreen Overlay for Ringing or Connected States
               AnimatedVisibility(
-                visible = callState !is CallState.Idle,
+                visible = callState !is CallState.Idle && !isMinimized,
                 enter = fadeIn(),
                 exit = fadeOut()
               ) {
@@ -104,10 +124,24 @@ class MainActivity : ComponentActivity() {
                   modifier = Modifier.fillMaxSize()
                 )
               }
+
+              // Draggable floating minimized call window for both participants
+              if (callState is CallState.Connected && isMinimized) {
+                com.example.ui.screens.MinimizedCallWindow(
+                  state = callState as CallState.Connected,
+                  viewModel = viewModel
+                )
+              }
             }
         }
       }
     }
+  }
+
+  override fun onNewIntent(intent: android.content.Intent) {
+      super.onNewIntent(intent)
+      setIntent(intent) // update the intent so LaunchedEffect sees it
+      viewModel.handleIntent(intent)
   }
 }
 

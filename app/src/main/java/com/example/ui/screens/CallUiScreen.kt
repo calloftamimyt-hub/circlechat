@@ -10,9 +10,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -250,11 +255,27 @@ fun ConnectedUi(
 ) {
     val contact = state.contact
     val isVideo = state.callType == "Video"
+    var showAddUserDialog by remember { mutableStateOf(false) }
+
+    // Toggle controls state. In video calls, controls are initially hidden to comply with instructions.
+    // In audio calls, they are always shown.
+    var showControls by remember { mutableStateOf(!isVideo) }
+
+    // Floating/Sliding controls offset
+    val bottomOffset by animateDpAsState(
+        targetValue = if (showControls) 0.dp else 300.dp,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
+    )
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (isVideo) {
-            // RENDERS PREMIUM DUAL-VIDEO SIMULATION
-            VideoCallLayout(state, viewModel)
+            // RENDERS PREMIUM DUAL-VIDEO SIMULATION WITH TAP/ADD Handlers
+            VideoCallLayout(
+                state = state,
+                viewModel = viewModel,
+                onBackgroundTap = { showControls = !showControls },
+                onAddContactClick = { showAddUserDialog = true }
+            )
         } else {
             // RENDERS PREMIUM AUDIO CALL PULSATERS
             AudioCallLayout(state, viewModel)
@@ -265,12 +286,14 @@ fun ConnectedUi(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
+                .offset(y = bottomOffset)
                 .background(
                     Brush.verticalGradient(
                         colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.82f))
                     )
                 )
                 .padding(horizontal = 24.dp, vertical = 32.dp)
+                .clickable(enabled = false, onClick = {}) // prevent click-through toggle
         ) {
             Column(
                 modifier = Modifier.fillMaxWidth(),
@@ -329,10 +352,109 @@ fun ConnectedUi(
                             onClick = { viewModel.toggleCamera() },
                             tag = "toggle_camera"
                         )
+
+                        // Bottom right minimized arrow button to open the chat view
+                        IconButton(
+                            onClick = { viewModel.setVideoCallMinimized(true) },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(Color.White.copy(alpha = 0.22f))
+                                .border(1.dp, Color.White.copy(alpha = 0.15f), CircleShape)
+                                .testTag("chat_arrow_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                                contentDescription = "Minimize to Chat View",
+                                tint = Color.White,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Gorgeous Add User Dialog (from list of previously chatted contacts)
+    if (showAddUserDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddUserDialog = false },
+            containerColor = Color(0xFF1E222A),
+            title = {
+                Text(
+                    text = "Add User to Call",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            },
+            text = {
+                val allContacts by viewModel.contacts.collectAsStateWithLifecycle()
+                
+                if (allContacts.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp), contentAlignment = Alignment.Center) {
+                        Text("No match found", color = Color.Gray, fontSize = 14.sp)
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 280.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        item {
+                            Text(
+                                text = "Previously Chatted List",
+                                color = ConvoColors.AccentMint,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                        }
+                        items(allContacts) { contact ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        showAddUserDialog = false
+                                        // Starts call / they will receive a call on their phone as requested!
+                                        viewModel.startCall(contact, isVideo = true)
+                                    }
+                                    .padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ContactAvatar(contact = contact, size = 36.dp, showStatusBadge = false)
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = contact.name,
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                    Text(
+                                        text = if (contact.status == "Online") "Online" else contact.lastActive,
+                                        color = if (contact.status == "Online") ConvoColors.AccentMint else Color.Gray,
+                                        fontSize = 11.sp
+                                    )
+                                }
+                                Icon(
+                                    imageVector = Icons.Default.Call,
+                                    contentDescription = "Call",
+                                    tint = ConvoColors.AccentMint,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAddUserDialog = false }) {
+                    Text("Close", color = Color.White)
+                }
+            }
+        )
     }
 }
 
@@ -437,7 +559,9 @@ fun AudioCallLayout(
 @Composable
 fun VideoCallLayout(
     state: CallState.Connected,
-    viewModel: ChatViewModel
+    viewModel: ChatViewModel,
+    onBackgroundTap: () -> Unit,
+    onAddContactClick: () -> Unit
 ) {
     // State to swap full-screen and PiP videos
     var isSwapped by remember { mutableStateOf(false) }
@@ -492,7 +616,7 @@ fun VideoCallLayout(
             modifier = Modifier
                 .fillMaxSize()
                 .clickable {
-                    // Tap on background controls layout
+                    onBackgroundTap()
                 }
         ) {
             // Determine what is currently full-screen
@@ -501,18 +625,46 @@ fun VideoCallLayout(
             if (isMainLocal) {
                 // If local stream is shown full-screen, respect camera state
                 if (state.isCamOn) {
-                    AndroidView(
-                        factory = { ctx ->
-                            SurfaceViewRenderer(ctx).apply {
-                                init(viewModel.rootEglBaseContext, null)
-                                setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                                setEnableHardwareScaler(true)
-                                setMirror(true) // local camera feels natural mirrored
-                                viewModel.attachLocalRenderer(this)
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        AndroidView(
+                            factory = { ctx ->
+                                SurfaceViewRenderer(ctx).apply {
+                                    init(viewModel.rootEglBaseContext, null)
+                                    setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                                    setEnableHardwareScaler(true)
+                                    setMirror(true) // local camera feels natural mirrored
+                                    viewModel.attachLocalRenderer(this)
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // Local Fullscreen Mic Transmission Status Indicator
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(top = 100.dp, start = 24.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (state.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                                    contentDescription = null,
+                                    tint = if (state.isMuted) Color.Red else ConvoColors.AccentMint,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Text(
+                                    text = if (state.isMuted) "Microphone Muted" else "Voice Transmitting • Active",
+                                    color = if (state.isMuted) Color.Red else ConvoColors.AccentMint,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
-                        },
-                        modifier = Modifier.fillMaxSize()
-                    )
+                        }
+                    }
                 } else {
                     // Camera is off, show beautiful centered full screen avatar screen
                     Box(
@@ -542,16 +694,12 @@ fun VideoCallLayout(
                 }
             } else {
                 // Default: Remote stream is full-screen
-                AndroidView(
-                    factory = { ctx ->
-                        SurfaceViewRenderer(ctx).apply {
-                            init(viewModel.rootEglBaseContext, null)
-                            setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                            setEnableHardwareScaler(true)
-                            viewModel.attachRemoteRenderer(this)
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
+                RemoteVideoFeed(
+                    contact = state.contact,
+                    isCompact = false,
+                    isMuted = state.isMuted,
+                    isSpeakerOn = state.isSpeakerOn,
+                    viewModel = viewModel
                 )
             }
 
@@ -595,39 +743,21 @@ fun VideoCallLayout(
                 )
             }
 
-            // Status Badge Pill with pulsing visual indicator
-            val infiniteTransition = rememberInfiniteTransition()
-            val pulseAlpha by infiniteTransition.animateFloat(
-                initialValue = 0.4f,
-                targetValue = 1.0f,
-                animationSpec = infiniteRepeatable(
-                    animation = tween(1000, easing = FastOutSlowInEasing),
-                    repeatMode = RepeatMode.Reverse
-                )
-            )
-
-            Row(
+            // Top right "add" icon button - replaces the "P2P STABLE • HD" text overlay as requested
+            IconButton(
+                onClick = { onAddContactClick() },
                 modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .border(1.dp, Color.White.copy(alpha = 0.2f), CircleShape)
+                    .testTag("add_user_in_call_btn")
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .graphicsLayer(alpha = pulseAlpha)
-                        .clip(CircleShape)
-                        .background(ConvoColors.AccentMint)
-                )
-                Text(
-                    text = "P2P STABLE • HD",
-                    color = Color.White,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 0.5.sp
+                Icon(
+                    imageVector = Icons.Default.PersonAdd,
+                    contentDescription = "Add User to Call",
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
                 )
             }
         }
@@ -700,18 +830,43 @@ fun VideoCallLayout(
             if (isPipLocal) {
                 // If local camera is on, render it inside PiP
                 if (state.isCamOn) {
-                    AndroidView(
-                        factory = { ctx ->
-                            SurfaceViewRenderer(ctx).apply {
-                                init(viewModel.rootEglBaseContext, null)
-                                setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                                setEnableHardwareScaler(true)
-                                setMirror(true)
-                                viewModel.attachLocalRenderer(this)
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize()
-                    )
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        AndroidView(
+                            factory = { ctx ->
+                                SurfaceViewRenderer(ctx).apply {
+                                    init(viewModel.rootEglBaseContext, null)
+                                    setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                                    setEnableHardwareScaler(true)
+                                    setMirror(true)
+                                    viewModel.attachLocalRenderer(this)
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // Local PiP Mic Active Overlay
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(4.dp)
+                                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (state.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                                contentDescription = null,
+                                tint = if (state.isMuted) Color.Red else ConvoColors.AccentMint,
+                                modifier = Modifier.size(8.dp)
+                            )
+                            Text(
+                                text = if (state.isMuted) "MUTED" else "MIC ON",
+                                color = if (state.isMuted) Color.Red else ConvoColors.AccentMint,
+                                fontSize = 6.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 } else {
                     // Camera off layout within PiP frame
                     Box(
@@ -742,16 +897,12 @@ fun VideoCallLayout(
                 }
             } else {
                 // Render remote feedback stream inside PiP frame
-                AndroidView(
-                    factory = { ctx ->
-                        SurfaceViewRenderer(ctx).apply {
-                            init(viewModel.rootEglBaseContext, null)
-                            setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                            setEnableHardwareScaler(true)
-                            viewModel.attachRemoteRenderer(this)
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
+                RemoteVideoFeed(
+                    contact = state.contact,
+                    isCompact = true,
+                    isMuted = state.isMuted,
+                    isSpeakerOn = state.isSpeakerOn,
+                    viewModel = viewModel
                 )
             }
 
@@ -874,4 +1025,288 @@ private fun formatDuration(seconds: Int): String {
     val minutes = seconds / 60
     val secs = seconds % 60
     return "%02d:%02d".format(minutes, secs)
+}
+
+@Composable
+fun RemoteVideoFeed(
+    contact: com.example.data.model.Contact,
+    isCompact: Boolean,
+    isMuted: Boolean,
+    isSpeakerOn: Boolean,
+    viewModel: ChatViewModel
+) {
+    // Elegant pulsing and breathing animations
+    val infiniteTransition = rememberInfiniteTransition(label = "remote_pulse")
+    val breatheScale by infiniteTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "breathe"
+    )
+
+    // Animated bounce values for interactive equalizer visualization
+    var amp1 by remember { mutableStateOf(10.dp) }
+    var amp2 by remember { mutableStateOf(20.dp) }
+    var amp3 by remember { mutableStateOf(15.dp) }
+    var amp4 by remember { mutableStateOf(28.dp) }
+    var amp5 by remember { mutableStateOf(12.dp) }
+
+    LaunchedEffect(Unit) {
+        val rand = java.util.Random()
+        while (true) {
+            delay(100)
+            amp1 = (8 + rand.nextInt(18)).dp
+            amp2 = (10 + rand.nextInt(26)).dp
+            amp3 = (6 + rand.nextInt(20)).dp
+            amp4 = (12 + rand.nextInt(30)).dp
+            amp5 = (5 + rand.nextInt(15)).dp
+        }
+    }
+
+    // Colors matching contact name
+    val listColors = listOf(
+        Color(0xFF3B82F6), Color(0xFF10B981), Color(0xFFF59E0B),
+        Color(0xFFEF4444), Color(0xFF8B5CF6), Color(0xFFEC4899)
+    )
+    val colorIndex = Math.abs(contact.name.hashCode()) % listColors.size
+    val primaryColor = listColors[colorIndex]
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF151821),
+                        primaryColor.copy(alpha = 0.15f),
+                        Color(0xFF0F1116)
+                    )
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        // Actual remote Video Stream
+        AndroidView(
+            factory = { ctx ->
+                SurfaceViewRenderer(ctx).apply {
+                    init(viewModel.rootEglBaseContext, null)
+                    setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                    setEnableHardwareScaler(true)
+                    viewModel.attachRemoteRenderer(this)
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Digital Camera Viewfinder Overlay
+        if (!isCompact) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp)
+            ) {
+                // Top elements
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(top = 100.dp, start = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(ConvoColors.AccentMint)
+                    )
+                    Text(
+                        text = "AUDIO & VIDEO ACTIVE",
+                        color = ConvoColors.AccentMint,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 0.5.sp
+                    )
+                }
+
+                Text(
+                    text = "HD 1080p • 60 FPS • Encrypted P2P",
+                    color = Color.White.copy(alpha = 0.4f),
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(bottom = 120.dp, start = 8.dp)
+                )
+            }
+        }
+
+        if (isCompact) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.5f))
+            ) {
+                Text(
+                    text = contact.name,
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(4.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun MinimizedCallWindow(
+    state: CallState.Connected,
+    viewModel: ChatViewModel
+) {
+    var parentSize by remember { mutableStateOf(IntSize.Zero) }
+    var pipSize by remember { mutableStateOf(IntSize.Zero) }
+
+    // Coordinates of the minimized floating window
+    var offsetX by remember { mutableStateOf(30f) }
+    var offsetY by remember { mutableStateOf(500f) }
+
+    val animatedOffsetX by animateFloatAsState(
+        targetValue = offsetX,
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessLow)
+    )
+    val animatedOffsetY by animateFloatAsState(
+        targetValue = offsetY,
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessLow)
+    )
+
+    // Position automatically once size is layout-decided
+    LaunchedEffect(parentSize, pipSize) {
+        if (parentSize != IntSize.Zero && pipSize != IntSize.Zero && offsetX == 30f && offsetY == 500f) {
+            offsetX = 24f
+            offsetY = parentSize.height - pipSize.height - 120f
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { parentSize = it }
+    ) {
+        Box(
+            modifier = Modifier
+                .onSizeChanged { pipSize = it }
+                .offset {
+                    IntOffset(
+                        animatedOffsetX.roundToInt(),
+                        animatedOffsetY.roundToInt()
+                    )
+                }
+                .width(180.dp)
+                .height(100.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(Color(0xE61E222A)) // dark frosted look
+                .border(2.dp, ConvoColors.ElectricBlue.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
+                .pointerInput(parentSize, pipSize) {
+                    detectDragGestures(
+                        onDragEnd = {
+                            if (parentSize == IntSize.Zero || pipSize == IntSize.Zero) return@detectDragGestures
+                            
+                            val leftSnap = 24f
+                            val rightSnap = parentSize.width - pipSize.width - 24f
+                            val topSnap = 100f
+                            val bottomSnap = parentSize.height - pipSize.height - 120f
+
+                            val midX = (leftSnap + rightSnap) / 2
+                            val midY = (topSnap + bottomSnap) / 2
+
+                            val targetX = if (offsetX < midX) leftSnap else rightSnap
+                            val targetY = if (offsetY < midY) topSnap else bottomSnap
+
+                            offsetX = targetX
+                            offsetY = targetY
+                        },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            offsetX += dragAmount.x
+                            offsetY += dragAmount.y
+
+                            if (parentSize != IntSize.Zero && pipSize != IntSize.Zero) {
+                                val maxX = parentSize.width - pipSize.width - 12f
+                                val maxY = parentSize.height - pipSize.height - 60f
+                                offsetX = offsetX.coerceIn(12f, maxX)
+                                offsetY = offsetY.coerceIn(40f, maxY)
+                            }
+                        }
+                    )
+                }
+                .clickable {
+                    // Tap to restore call to full screen
+                    viewModel.setVideoCallMinimized(false)
+                }
+                .padding(10.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                // Dual Avatars side-by-side representing both participants
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy((-12).dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Let's draw other participant avatar
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .border(1.5.dp, Color.White, CircleShape)
+                            .clip(CircleShape)
+                    ) {
+                        ContactAvatar(contact = state.contact, size = 42.dp, showStatusBadge = false)
+                    }
+                    // Let's draw local participant avatar
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .border(1.5.dp, ConvoColors.AccentMint, CircleShape)
+                            .clip(CircleShape)
+                            .background(Color.DarkGray),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "You",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(6.dp))
+                
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(ConvoColors.AccentMint)
+                    )
+                    Text(
+                        text = "Call Active • ${formatDuration(state.durationSeconds)}",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+    }
 }

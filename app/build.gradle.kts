@@ -9,12 +9,12 @@ plugins {
 
 android {
   namespace = "com.example"
-  compileSdk { version = release(36) { minorApiLevel = 1 } }
+  compileSdk = 35
 
   defaultConfig {
     applicationId = "com.circlechat"
     minSdk = 24
-    targetSdk = 36
+    targetSdk = 35
     versionCode = 1
     versionName = "1.0"
 
@@ -124,3 +124,45 @@ dependencies {
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
 }
+
+abstract class CopyApkTask : DefaultTask() {
+    @get:InputFile
+    abstract val sourceApk: RegularFileProperty
+
+    @get:Internal
+    abstract val rootDir: DirectoryProperty
+
+    @TaskAction
+    fun copyApk() {
+        val src = sourceApk.get().asFile
+        if (src.exists()) {
+            val root = rootDir.get().asFile
+            
+            // Copy to build-outputs folder
+            val destDir = File(root, "build-outputs")
+            destDir.mkdirs()
+            val destBuild = File(destDir, "CircleChat.apk")
+            src.copyTo(destBuild, overwrite = true)
+            
+            // Copy directly to root folder so it's super easy to find
+            val destRoot = File(root, "CircleChat.apk")
+            src.copyTo(destRoot, overwrite = true)
+            
+            println("APK successfully copied to root and build-outputs/CircleChat.apk!")
+        }
+    }
+}
+
+val copyApk = tasks.register<CopyApkTask>("copyApk") {
+    sourceApk.set(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+    rootDir.set(rootProject.layout.projectDirectory)
+}
+
+project.afterEvaluate {
+    tasks.findByName("assembleDebug")?.let { assembleTask ->
+        assembleTask.finalizedBy(copyApk)
+    }
+}
+
+
+

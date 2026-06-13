@@ -1,6 +1,7 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -73,6 +74,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _callState = MutableStateFlow<CallState>(CallState.Idle)
     val callState: StateFlow<CallState> = _callState.asStateFlow()
 
+    private val _isVideoCallMinimized = MutableStateFlow(false)
+    val isVideoCallMinimized: StateFlow<Boolean> = _isVideoCallMinimized.asStateFlow()
+
+    fun setVideoCallMinimized(minimized: Boolean) {
+        _isVideoCallMinimized.value = minimized
+    }
+
     // Typing field input state
     private val _typedMessage = MutableStateFlow("")
     val typedMessage: StateFlow<String> = _typedMessage.asStateFlow()
@@ -100,6 +108,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var localVideoSource: VideoSource? = null
     internal var localVideoTrack: VideoTrack? = null
+    private var localAudioSource: AudioSource? = null
+    internal var localAudioTrack: AudioTrack? = null
+    internal var remoteVideoTrack: VideoTrack? = null
+    private var webrtcManager: com.example.data.webrtc.WebRTCManager? = null
+    private var iceCandidatesListener: com.google.firebase.firestore.ListenerRegistration? = null
     private var videoCapturer: CameraVideoCapturer? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
 
@@ -116,6 +129,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var activeFirebaseCallId: String? = null
     private var activeFirebaseListener: com.google.firebase.firestore.ListenerRegistration? = null
     private var incomingCallsListener: com.google.firebase.firestore.ListenerRegistration? = null
+    private var signalingJob: Job? = null
+    private var signalingListenerRegistration: com.google.firebase.firestore.ListenerRegistration? = null
 
     init {
         // Pre-seed the database if it's currently empty
@@ -147,6 +162,86 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     // Ring on incoming call
                     soundPlayer.startRinging()
+                    startListeningForIncomingCallStatus(caller, callId)
+                }
+            }
+        }
+    }
+
+    private fun startListeningForIncomingCallStatus(caller: Contact, callId: String) {
+        activeFirebaseListener?.remove()
+        val firestore = com.example.data.firebase.FirebaseManager.getFirestore() ?: return
+        val myUid = _myUid.value ?: return
+
+        activeFirebaseListener = firestore.collection("users").document(myUid)
+            .collection("calls").document(callId)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    Log.e("ChatViewModel", "Error listening for incoming call status", error)
+                    return@addSnapshotListener
+                }
+                if (snapshot == null || !snapshot.exists() || snapshot.getString("status") == "ended") {
+                    val current = _callState.value
+                    if (current is CallState.Ringing || current is CallState.Connected) {
+                        resetCallEngine()
+                    }
+                }
+            }
+    }
+
+    private fun startListeningForCallStatus(contact: Contact, callId: String, callType: String) {
+        activeFirebaseListener?.remove()
+        val firestore = com.example.data.firebase.FirebaseManager.getFirestore() ?: return
+
+        activeFirebaseListener = firestore.collection("users").document(contact.firebaseUid)
+            .collection("calls").document(callId)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    Log.e("ChatViewModel", "Error listening for call acceptance status", error)
+                    return@addSnapshotListener
+                }
+                if (snapshot != null && snapshot.exists()) {
+                    val status = snapshot.getString("status")
+                    if (status == "answered") {
+                        val current = _callState.value
+                        if (current !is CallState.Connected) {
+                            connectCall(contact, callType, isCaller = true)
+                        }
+                    } else if (status == "ended") {
+                        val current = _callState.value
+                        if (current is CallState.Ringing || current is CallState.Connected) {
+                            resetCallEngine()
+                        }
+                    }
+                } else {
+                    val current = _callState.value
+                    if (current is CallState.Ringing || current is CallState.Connected) {
+                        resetCallEngine()
+                    }
+                }
+            }
+    }
+
+    fun loginOfflineDemo() {
+        viewModelScope.launch {
+            _myUid.value = "local_demo_uid"
+            _isFirebaseActive.value = true
+            _syncStatus.value = "Demo Offline Mode"
+            seedDemoContacts()
+        }
+    }
+
+    fun seedDemoContacts() {
+        viewModelScope.launch {
+            val dbContacts = repository.allContacts.first()
+            if (dbContacts.isEmpty()) {
+                val demoContacts = listOf(
+                    Contact(name = "Tahsin Ahmed", avatarUrl = "", status = "Online", lastActive = "Now", bio = "CircleChat Developer • Ping me for call tests!", firebaseUid = ""),
+                    Contact(name = "Sara Islam", avatarUrl = "", status = "Away", lastActive = "5m ago", bio = "Design Lead • Enjoys video chats ✨", firebaseUid = ""),
+                    Contact(name = "Aurnob Roy", avatarUrl = "", status = "Offline", lastActive = "Yesterday", bio = "DevOps Advocate • Ping for voice calls", firebaseUid = "")
+                )
+                demoContacts.forEach {
+                    repository.insertContact(it)
                 }
             }
         }
@@ -210,6 +305,54 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun handleIntent(intent: android.content.Intent?) {
+        if (intent == null) return
+        val isCall = intent.getBooleanExtra("incoming_call", false)
+        if (isCall) {
+            val callerName = intent.getStringExtra("callerName") ?: "Unknown"
+            val callType = intent.getStringExtra("callType") ?: "Audio"
+            val roomId = intent.getStringExtra("roomId") ?: ""
+            val callerUid = intent.getStringExtra("callerUid") ?: "mock_uid"
+            val acceptCall = intent.getBooleanExtra("accept_call", false)
+            
+            viewModelScope.launch {
+                // Try to get contact, if null, simulate a contact
+                var contact = repository.getContactByFirebaseUid(callerUid)
+                if (contact == null) {
+                    contact = Contact(
+                        name = callerName,
+                        avatarUrl = "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150",
+                        bio = "Incoming Call...",
+                        status = "Online",
+                        lastActive = "Now",
+                        firebaseUid = callerUid
+                    )
+                }
+                
+                activeFirebaseCallId = roomId
+                if (acceptCall) {
+                     _callState.value = CallState.Ringing(contact, false, callType)
+                     com.example.data.firebase.FirebaseManager.acceptCall(callerUid, roomId)
+                     connectCall(contact, callType, isCaller = false)
+                } else {
+                     _callState.value = CallState.Ringing(contact, false, callType)
+                     soundPlayer.startRinging()
+                     startListeningForIncomingCallStatus(contact, roomId)
+                }
+            }
+        } else {
+            val chatUid = intent.getStringExtra("chat_firebase_uid")
+            if (chatUid != null) {
+                viewModelScope.launch {
+                    val contact = repository.getContactByFirebaseUid(chatUid)
+                    if (contact != null) {
+                        selectContactChat(contact.id)
+                    }
+                }
+            }
+        }
+    }
+
     fun selectContactChat(contactId: Long?) {
         _activeContactId.value = contactId
         _typedMessage.value = "" // clear draft
@@ -222,6 +365,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Subscribe to real-time sync if this contact is a Firebase Live Buddy
             viewModelScope.launch {
                 repository.getContactById(contactId).first()?.let { contact ->
+                    com.example.data.firebase.FirebaseManager.activeChatFirebaseUid = contact.firebaseUid
                     if (contact.firebaseUid.isNotEmpty() && com.example.data.firebase.FirebaseManager.isFirebaseAvailable) {
                         activeMessageListener = com.example.data.firebase.FirebaseManager.listenToRealtimeMessages(
                             friendFirebaseUid = contact.firebaseUid,
@@ -232,6 +376,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
+        } else {
+            com.example.data.firebase.FirebaseManager.activeChatFirebaseUid = null
         }
     }
 
@@ -329,22 +475,41 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- CALLS HANDLING ENGINE ---
 
+    private var isWebRtcInitialized = false
+
     private fun initWebRtc() {
-        if (peerConnectionFactory != null) return
-        try {
-            val context = getApplication<Application>().applicationContext
+        if (webrtcManager != null) return
+        val context = getApplication<Application>().applicationContext
+        
+        if (!isWebRtcInitialized) {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context)
                     .setEnableInternalTracer(true)
                     .createInitializationOptions()
             )
-            val options = PeerConnectionFactory.Options()
-            peerConnectionFactory = PeerConnectionFactory.builder()
-                .setOptions(options)
-                .createPeerConnectionFactory()
-        } catch (e: Exception) {
-            Log.e("ChatViewModel", "Error initializing PeerConnectionFactory", e)
+            isWebRtcInitialized = true
         }
+        
+        webrtcManager = com.example.data.webrtc.WebRTCManager(
+            context = context,
+            eglBaseContext = rootEglBaseContext,
+            onIceCandidate = { candidate ->
+                sendIceCandidateToFirebase(candidate)
+            },
+            onAddStream = { stream ->
+                if (stream.videoTracks.isNotEmpty()) {
+                    remoteVideoTrack = stream.videoTracks[0]
+                    // If UI was already attached before track arrived
+                    attachedRemoteRenderer?.let { remoteVideoTrack?.addSink(it) }
+                }
+            }
+        )
+        peerConnectionFactory = webrtcManager?.getFactory()
+        
+        // Setup Audio
+        val audioConstraints = MediaConstraints()
+        localAudioSource = peerConnectionFactory?.createAudioSource(audioConstraints)
+        localAudioTrack = peerConnectionFactory?.createAudioTrack("101", localAudioSource)
     }
 
     fun startCameraCapture() {
@@ -392,7 +557,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun stopCameraCapture() {
         try {
             attachedLocalRenderer?.let { localVideoTrack?.removeSink(it) }
-            attachedRemoteRenderer?.let { localVideoTrack?.removeSink(it) }
+            attachedRemoteRenderer?.let { remoteVideoTrack?.removeSink(it) }
             attachedLocalRenderer = null
             attachedRemoteRenderer = null
 
@@ -405,6 +570,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
             localVideoSource?.dispose()
             localVideoSource = null
+            localAudioSource?.dispose()
+            localAudioSource = null
         } catch (e: Exception) {
             Log.e("ChatViewModel", "Error stopping camera capture", e)
         }
@@ -417,7 +584,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun attachRemoteRenderer(renderer: SurfaceViewRenderer) {
         attachedRemoteRenderer = renderer
-        localVideoTrack?.addSink(renderer)
+        remoteVideoTrack?.addSink(renderer)
     }
 
     fun startCall(contact: Contact, isVideo: Boolean) {
@@ -435,15 +602,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Firebase real-time signaling
         if (contact.firebaseUid.isNotEmpty() && com.example.data.firebase.FirebaseManager.isFirebaseAvailable) {
             viewModelScope.launch {
-                activeFirebaseCallId = com.example.data.firebase.FirebaseManager.startCall(contact.firebaseUid, if (isVideo) "Video" else "Audio")
+                val callId = com.example.data.firebase.FirebaseManager.startCall(contact.firebaseUid, if (isVideo) "Video" else "Audio")
+                activeFirebaseCallId = callId
+                if (callId != null) {
+                    startListeningForCallStatus(contact, callId, if (isVideo) "Video" else "Audio")
+                }
             }
         }
 
-        // Automatically connect call after 5 seconds of "ringing" simulation if offline
+        // Automatically connect call after 3 seconds of "ringing" simulation if offline
         ringTimeoutJob = viewModelScope.launch {
-            delay(5000)
+            delay(3000)
             if (activeFirebaseCallId == null) {
-                connectCall(contact, if (isVideo) "Video" else "Audio")
+                connectCall(contact, if (isVideo) "Video" else "Audio", isCaller = true)
             }
         }
     }
@@ -472,7 +643,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            connectCall(current.contact, current.callType)
+            connectCall(current.contact, current.callType, isCaller = false)
         }
     }
 
@@ -516,7 +687,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         resetCallEngine()
     }
 
-    private fun connectCall(contact: Contact, callType: String) {
+    private fun connectCall(contact: Contact, callType: String, isCaller: Boolean) {
         soundPlayer.stop() // stop ringtone loops immediately
 
         _callState.value = CallState.Connected(
@@ -525,9 +696,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             durationSeconds = 0
         )
 
+        initWebRtc()
         if (callType == "Video") {
             startCameraCapture()
         }
+        webrtcManager?.createPeerConnection()
+        webrtcManager?.addLocalStream(if (callType == "Video") localVideoTrack else null, localAudioTrack)
+
+        startWebRTCSignaling(isCaller)
 
         // Start duration counter incrementing every second
         callTimerJob = viewModelScope.launch {
@@ -584,18 +760,98 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         resetCallEngine()
     }
 
+    private fun testAudioAndVideo() {}
+    
+    private fun startWebRTCSignaling(isCaller: Boolean) {
+        val cid = activeFirebaseCallId ?: return
+        val firestore = com.example.data.firebase.FirebaseManager.getFirestore() ?: return
+        val myUid = _myUid.value ?: return
+
+        signalingJob = viewModelScope.launch {
+            if (isCaller) {
+                webrtcManager?.createOffer { sessionDescription ->
+                    val offerMap = hashMapOf("type" to "offer", "sdp" to sessionDescription.description)
+                    firestore.collection("calls").document(cid).update("offer", offerMap)
+                }
+            }
+            
+            signalingListenerRegistration = firestore.collection("calls").document(cid)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+
+                    if (!isCaller && snapshot.contains("offer") && webrtcManager?.peerConnection?.remoteDescription == null) {
+                        val offerMap = snapshot.get("offer") as? Map<String, String>
+                        val sdpString = offerMap?.get("sdp")
+                        if (sdpString != null) {
+                            webrtcManager?.setRemoteDescription(SessionDescription(SessionDescription.Type.OFFER, sdpString))
+                            webrtcManager?.createAnswer { sessionDescription ->
+                                val ansMap = hashMapOf("type" to "answer", "sdp" to sessionDescription.description)
+                                firestore.collection("calls").document(cid).update("answer", ansMap)
+                            }
+                        }
+                    }
+
+                    if (isCaller && snapshot.contains("answer") && webrtcManager?.peerConnection?.remoteDescription == null) {
+                        val ansMap = snapshot.get("answer") as? Map<String, String>
+                        val sdpString = ansMap?.get("sdp")
+                        if (sdpString != null) {
+                            webrtcManager?.setRemoteDescription(SessionDescription(SessionDescription.Type.ANSWER, sdpString))
+                        }
+                    }
+                }
+
+            iceCandidatesListener = firestore.collection("calls").document(cid).collection("candidates")
+                .addSnapshotListener { snapshots, error ->
+                    if (error != null || snapshots == null) return@addSnapshotListener
+                    for (dc in snapshots.documentChanges) {
+                        if (dc.type == com.google.firebase.firestore.DocumentChange.Type.ADDED) {
+                            val data = dc.document.data
+                            val sender = data["sender"] as? String
+                            if (sender != null && sender != myUid) {
+                                val sdpMid = data["sdpMid"] as? String ?: ""
+                                val sdpMLineIndex = (data["sdpMLineIndex"] as? Long)?.toInt() ?: 0
+                                val sdp = data["sdp"] as? String ?: ""
+                                webrtcManager?.addRemoteIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
+                            }
+                        }
+                    }
+                }
+        }
+    }
+
+    private fun sendIceCandidateToFirebase(candidate: IceCandidate) {
+        val cid = activeFirebaseCallId ?: return
+        val firestore = com.example.data.firebase.FirebaseManager.getFirestore() ?: return
+        val map = hashMapOf(
+            "sdpMid" to candidate.sdpMid,
+            "sdpMLineIndex" to candidate.sdpMLineIndex,
+            "sdp" to candidate.sdp,
+            "sender" to (_myUid.value ?: "unknown")
+        )
+        firestore.collection("calls").document(cid).collection("candidates").add(map)
+    }
+
     // Call settings modifiers in connected mode
     fun toggleMute() {
         val current = _callState.value
         if (current is CallState.Connected) {
-            _callState.value = current.copy(isMuted = !current.isMuted)
+            val newState = !current.isMuted
+            _callState.value = current.copy(isMuted = newState)
+            localAudioTrack?.setEnabled(!newState)
         }
     }
 
     fun toggleSpeaker() {
         val current = _callState.value
         if (current is CallState.Connected) {
-            _callState.value = current.copy(isSpeakerOn = !current.isSpeakerOn)
+            val newState = !current.isSpeakerOn
+            _callState.value = current.copy(isSpeakerOn = newState)
+            
+            try {
+                val context = getApplication<Application>().applicationContext
+                val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                audioManager.isSpeakerphoneOn = newState
+            } catch (e: Exception) {}
         }
     }
 
@@ -604,11 +860,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (current is CallState.Connected && current.callType == "Video") {
             val nextCam = !current.isCamOn
             _callState.value = current.copy(isCamOn = nextCam)
-            if (nextCam) {
-                startCameraCapture()
-            } else {
-                stopCameraCapture()
-            }
+            localVideoTrack?.setEnabled(nextCam)
         }
     }
 
@@ -623,10 +875,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         soundPlayer.stop() // stop any audio loops
         stopCameraCapture() // stop camera capture
 
+        signalingJob?.cancel()
+        signalingJob = null
+        signalingListenerRegistration?.remove()
+        signalingListenerRegistration = null
+        iceCandidatesListener?.remove()
+        iceCandidatesListener = null
+        webrtcManager?.dispose()
+        webrtcManager = null
+
         callTimerJob?.cancel()
         callTimerJob = null
         ringTimeoutJob?.cancel()
         ringTimeoutJob = null
+        activeFirebaseListener?.remove()
+        activeFirebaseListener = null
+        activeFirebaseCallId = null
+        _isVideoCallMinimized.value = false
         _callState.value = CallState.Idle
     }
 

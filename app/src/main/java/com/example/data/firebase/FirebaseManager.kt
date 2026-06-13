@@ -40,6 +40,8 @@ data class FirestoreMessage(
 object FirebaseManager {
     private const val TAG = "FirebaseManager"
     
+    var activeChatFirebaseUid: String? = null
+
     var isFirebaseAvailable: Boolean = false
         private set
 
@@ -319,16 +321,6 @@ object FirebaseManager {
                                     )
                                 )
                                 Log.d(TAG, "Synced new real-time message: $content from $senderUid")
-                                
-                                // Show Push Notification
-                                val friendInfo = repository.getContactByFirebaseUid(senderUid)
-                                val title = friendInfo?.name ?: "New Message"
-                                NotificationHelper.showNotification(
-                                    context = com.example.MainActivity.appContext, 
-                                    title = title, 
-                                    message = content, 
-                                    notificationId = fId.hashCode()
-                                )
                             }
                         }
                     }
@@ -391,8 +383,6 @@ object FirebaseManager {
     }
 
     suspend fun acceptCall(callerFirebaseUid: String, callId: String) = withContext(Dispatchers.IO) {
-        // Technically this involves both users listening to same doc.
-        // For simplicity, we just mark our local doc as "answered".
         val firestore = getFirestore() ?: return@withContext
         val myUid = getAuth()?.currentUser?.uid ?: return@withContext
         
@@ -400,6 +390,10 @@ object FirebaseManager {
             firestore.collection("users").document(myUid)
                 .collection("calls").document(callId)
                 .update("status", "answered").await()
+            
+            // Also create a global call room for WebRTC signaling
+            firestore.collection("calls").document(callId)
+                .set(hashMapOf("status" to "answered", "timestamp" to System.currentTimeMillis())).await()
         } catch(e: Exception) {}
     }
 
@@ -408,13 +402,16 @@ object FirebaseManager {
         val myUid = getAuth()?.currentUser?.uid ?: return@withContext
         
         try {
+            // Mark ended in global
+            firestore.collection("calls").document(callId).update("status", "ended").await()
             // Delete from receiver
             firestore.collection("users").document(friendFirebaseUid)
-                .collection("calls").document(callId).delete().await()
+                .collection("calls").document(callId).update("status", "ended").await()
                 
             // And delete from me just in case
             firestore.collection("users").document(myUid)
-                 .collection("calls").document(callId).delete().await()
+                 .collection("calls").document(callId).update("status", "ended").await()
         } catch(e: Exception) {}
     }
+
 }

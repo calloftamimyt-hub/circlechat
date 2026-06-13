@@ -1,0 +1,36 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default rule: Deny all by default for security
+    // match /{document=**} {
+    //   allow read, write: if false;
+    // }
+
+    // Users Collection: Users can read all profiles, but only edit their own
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+
+      // Messages Subcollection: Authenticated users can send/receive messages
+      match /messages/{messageId} {
+        allow read, write: if request.auth != null;
+      }
+
+      // Calls Subcollection: Used for incoming call signaling
+      match /calls/{callId} {
+        allow read, write: if request.auth != null;
+      }
+    }
+
+    // Global Calls Collection: Used for WebRTC Signaling (Offers, Answers, ICE Candidates)
+    match /calls/{callId} {
+        allow read, write: if request.auth != null;
+        
+        // WebRTC ICE Candidates
+        match /candidates/{candidateId} {
+            allow read, write: if request.auth != null;
+        }
+    }
+  }
+}

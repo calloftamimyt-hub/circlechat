@@ -128,6 +128,20 @@ fun LoginScreen(viewModel: ChatViewModel, modifier: Modifier = Modifier) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        OutlinedButton(
+            onClick = { viewModel.loginOfflineDemo() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = ConvoColors.ElectricBlue),
+            border = androidx.compose.foundation.BorderStroke(1.5.dp, ConvoColors.ElectricBlue)
+        ) {
+            Text(text = "Try Offline Demo Mode", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
         TextButton(onClick = { 
             isSignUp = !isSignUp
             message = ""
