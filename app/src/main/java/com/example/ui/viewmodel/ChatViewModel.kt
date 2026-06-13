@@ -330,6 +330,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 
                 activeFirebaseCallId = roomId
+                
+                // Cancel notification
+                val notificationManager = getApplication<Application>().getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                notificationManager.cancel(roomId.hashCode())
+
                 if (acceptCall) {
                      _callState.value = CallState.Ringing(contact, false, callType)
                      com.example.data.firebase.FirebaseManager.acceptCall(callerUid, roomId)

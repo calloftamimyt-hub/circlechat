@@ -114,14 +114,16 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
         )
 
         // Accept intent
-        val acceptIntent = Intent(this, CallActionReceiver::class.java).apply {
-            action = "ACCEPT_CALL"
+        val acceptIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra("incoming_call", true)
+            putExtra("accept_call", true)
             putExtra("roomId", roomId)
             putExtra("callerUid", callerUid)
             putExtra("callType", callType)
             putExtra("callerName", callerName)
         }
-        val acceptPendingIntent = PendingIntent.getBroadcast(this, 1, acceptIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val acceptPendingIntent = PendingIntent.getActivity(this, roomId.hashCode() + 1, acceptIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
         // Decline intent
         val declineIntent = Intent(this, CallActionReceiver::class.java).apply {
