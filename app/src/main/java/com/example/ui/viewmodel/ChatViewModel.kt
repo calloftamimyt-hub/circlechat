@@ -1,0 +1,511 @@
+package com.example.ui.viewmodel
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.data.model.CallLog
+import com.example.data.model.Contact
+import com.example.data.model.Message
+import com.example.data.repository.ChatRepository
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+sealed interface CallState {
+    object Idle : CallState
+    data class Ringing(
+        val contact: Contact,
+        val isOutgoing: Boolean,
+        val callType: String // "Audio" or "Video"
+    ) : CallState
+    data class Connected(
+        val contact: Contact,
+        val callType: String, // "Audio" or "Video"
+        val durationSeconds: Int,
+        val isMuted: Boolean = false,
+        val isSpeakerOn: Boolean = true,
+        val isCamOn: Boolean = true,
+        val selectedFilter: String = "Normal" // "Normal", "Cinematic", "Sepia", "Vibrant", "Noir"
+    ) : CallState
+}
+
+enum class HomeTab {
+    CHATS, CALLS, CONTACTS
+}
+
+class ChatViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val repository = ChatRepository(application)
+
+    // UI state flows
+    val contacts: StateFlow<List<Contact>> = repository.allContacts
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val callLogs: StateFlow<List<CallLog>> = repository.allCallLogs
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Active Tab Navigation
+    private val _currentTab = MutableStateFlow(HomeTab.CHATS)
+    val currentTab: StateFlow<HomeTab> = _currentTab.asStateFlow()
+
+    // Selected Contact ID for current active Chat (null if on list screens)
+    private val _activeContactId = MutableStateFlow<Long?>(null)
+    val activeContactId: StateFlow<Long?> = _activeContactId.asStateFlow()
+
+    // Observable flow of messages for the active conversation
+    val activeMessages: Flow<List<Message>> = _activeContactId.flatMapLatest { id ->
+        if (id != null) {
+            repository.getMessagesForContact(id)
+        } else {
+            flowOf(emptyList())
+        }
+    }
+
+    // Active contact detailing for headers
+    val activeContact: Flow<Contact?> = _activeContactId.flatMapLatest { id ->
+        if (id != null) repository.getContactById(id) else flowOf(null)
+    }
+
+    // Active Call State
+    private val _callState = MutableStateFlow<CallState>(CallState.Idle)
+    val callState: StateFlow<CallState> = _callState.asStateFlow()
+
+    // Typing field input state
+    private val _typedMessage = MutableStateFlow("")
+    val typedMessage: StateFlow<String> = _typedMessage.asStateFlow()
+
+    // My Firebase UID for Identity
+    private val _myUid = MutableStateFlow<String?>(null)
+    val myUid: StateFlow<String?> = _myUid.asStateFlow()
+
+    // Firebase Auth Connection State
+    private val _isFirebaseActive = MutableStateFlow(false)
+    val isFirebaseActive: StateFlow<Boolean> = _isFirebaseActive.asStateFlow()
+
+    // Firebase Sync Status Logs & Dialog helper message
+    private val _syncStatus = MutableStateFlow("Local Mode (Click Go Online to link)")
+    val syncStatus: StateFlow<String> = _syncStatus.asStateFlow()
+
+    val isFirebaseLibraryInitialized: Boolean
+        get() = com.example.data.firebase.FirebaseManager.isFirebaseAvailable
+
+    // For call timers
+    private var callTimerJob: Job? = null
+    private var ringTimeoutJob: Job? = null
+
+    // For active Firestore real-time message queries
+    private var activeMessageListener: com.google.firebase.firestore.ListenerRegistration? = null
+
+    private var activeFirebaseCallId: String? = null
+    private var activeFirebaseListener: com.google.firebase.firestore.ListenerRegistration? = null
+    private var incomingCallsListener: com.google.firebase.firestore.ListenerRegistration? = null
+
+    init {
+        // Pre-seed the database if it's currently empty
+        repository.preseedDatabaseIfEmpty(viewModelScope)
+        
+        // Initialize Firebase safely
+        com.example.data.firebase.FirebaseManager.initialize(application)
+
+        // Check if already signed in
+        val currentUser = com.example.data.firebase.FirebaseManager.getAuth()?.currentUser
+        if (currentUser != null) {
+            _myUid.value = currentUser.uid
+            _isFirebaseActive.value = true
+            startListeningForCalls()
+        }
+    }
+
+    private fun startListeningForCalls() {
+        incomingCallsListener?.remove()
+        incomingCallsListener = com.example.data.firebase.FirebaseManager.listenForIncomingCalls(repository) { callerUid, type, callId ->
+            viewModelScope.launch {
+                val caller = repository.getContactByFirebaseUid(callerUid)
+                if (caller != null && _callState.value is CallState.Idle) {
+                    activeFirebaseCallId = callId
+                    _callState.value = CallState.Ringing(
+                        contact = caller,
+                        isOutgoing = false,
+                        callType = type
+                    )
+                }
+            }
+        }
+    }
+
+    fun setTab(tab: HomeTab) {
+        _currentTab.value = tab
+    }
+
+    // Login with Phone
+    fun signInWithPhone(phone: String, pass: String, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            _syncStatus.value = "Authenticating..."
+            val uid = com.example.data.firebase.FirebaseManager.signInWithPhoneAndPassword(phone, pass)
+            if (uid != null) {
+                _myUid.value = uid
+                _isFirebaseActive.value = true
+                _syncStatus.value = "Online. Signed in with $phone"
+                onResult(true, "Success")
+            } else {
+                _syncStatus.value = "Authentication failed."
+                _isFirebaseActive.value = false
+                onResult(false, "Login failed. Check internet, or ensure account exists.")
+            }
+        }
+    }
+
+    // Sign Up with Phone
+    fun signUpWithPhone(phone: String, pass: String, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            _syncStatus.value = "Creating Account..."
+            val uid = com.example.data.firebase.FirebaseManager.signUpWithPhoneAndPassword(phone, pass)
+            if (uid != null) {
+                _myUid.value = uid
+                _isFirebaseActive.value = true
+                _syncStatus.value = "Online. Registration complete."
+                
+                // Save phone to profile
+                com.example.data.firebase.FirebaseManager.saveCurrentUserProfile(phone)
+                onResult(true, "Success")
+            } else {
+                _syncStatus.value = "Registration failed."
+                _isFirebaseActive.value = false
+                onResult(false, "Sign-up failed.")
+            }
+        }
+    }
+
+    // Add / connect a friend by Phone Number
+    fun connectFriendByPhone(phone: String, onComplete: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            _syncStatus.value = "Searching for: $phone"
+            val contact = com.example.data.firebase.FirebaseManager.connectFriendByPhone(phone.trim(), repository)
+            if (contact != null) {
+                _syncStatus.value = "Linked successfully: ${contact.name}"
+                onComplete(true)
+            } else {
+                _syncStatus.value = "Failed: No account found with that number."
+                onComplete(false)
+            }
+        }
+    }
+
+    fun selectContactChat(contactId: Long?) {
+        _activeContactId.value = contactId
+        _typedMessage.value = "" // clear draft
+
+        // Unsubscribe from previous snapshot listeners
+        activeMessageListener?.remove()
+        activeMessageListener = null
+
+        if (contactId != null) {
+            // Subscribe to real-time sync if this contact is a Firebase Live Buddy
+            viewModelScope.launch {
+                repository.getContactById(contactId).first()?.let { contact ->
+                    if (contact.firebaseUid.isNotEmpty() && com.example.data.firebase.FirebaseManager.isFirebaseAvailable) {
+                        activeMessageListener = com.example.data.firebase.FirebaseManager.listenToRealtimeMessages(
+                            friendFirebaseUid = contact.firebaseUid,
+                            localContactId = contactId,
+                            repository = repository,
+                            scope = viewModelScope
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun logout() {
+        _isFirebaseActive.value = false
+        _myUid.value = null
+        activeMessageListener?.remove()
+        activeMessageListener = null
+    }
+
+    fun updateTypedMessage(text: String) {
+        _typedMessage.value = text
+    }
+
+    fun getLatestMessage(contactId: Long): Flow<Message?> {
+        return repository.getLatestMessage(contactId)
+    }
+
+    fun clearAllLogs() {
+        viewModelScope.launch {
+            repository.clearAllLogs()
+        }
+    }
+
+    fun sendMessage() {
+        val contactId = _activeContactId.value ?: return
+        val text = _typedMessage.value.trim()
+        if (text.isEmpty()) return
+
+        viewModelScope.launch {
+            _typedMessage.value = ""
+
+            val contact = repository.getContactById(contactId).first()
+            if (contact != null && contact.firebaseUid.isNotEmpty() && com.example.data.firebase.FirebaseManager.isFirebaseAvailable) {
+                val success = com.example.data.firebase.FirebaseManager.sendLiveMessage(
+                    friendFirebaseUid = contact.firebaseUid,
+                    localContactId = contactId,
+                    content = text,
+                    repository = repository
+                )
+                if (!success) {
+                    // Fallback to local insertion if sending live failed (e.g. offline)
+                    repository.insertMessage(
+                        Message(
+                            contactId = contactId,
+                            content = text,
+                            timestamp = System.currentTimeMillis(),
+                            isFromMe = true,
+                            status = "Sent"
+                        )
+                    )
+                }
+            } else {
+                // Regular local flow
+                repository.insertMessage(
+                    Message(
+                        contactId = contactId,
+                        content = text,
+                        timestamp = System.currentTimeMillis(),
+                        isFromMe = true,
+                        status = "Sent"
+                    )
+                )
+
+                // Simulate quick reactive reply from the contact to show Messenger-like responsive behavior!
+                delay(1500)
+                val replyText = getMockAutoReply(text)
+                repository.insertMessage(
+                    Message(
+                        contactId = contactId,
+                        content = replyText,
+                        timestamp = System.currentTimeMillis(),
+                        isFromMe = false,
+                        status = "Read"
+                    )
+                )
+            }
+        }
+    }
+
+    private fun getMockAutoReply(query: String): String {
+        val q = query.lowercase()
+        return when {
+            q.contains("hello") || q.contains("hey") || q.contains("hi") -> 
+                "Hey! Just checking out Convo's beautiful interface. It feels so premium!"
+            q.contains("call") || q.contains("video") || q.contains("audio") || q.contains("talk") -> 
+                "Yes! Click the Call option in the top bar. I'm connected and ready to chat!"
+            q.contains("how") || q.contains("fine") || q.contains("good") -> 
+                "Everything is performing incredibly! Our Room database queries are updating dynamically on the main thread."
+            q.contains("design") || q.contains("beautiful") || q.contains("screens") -> 
+                "I agree, the color scheme matches material standards, and the typography pairings look amazing! ✨"
+            else -> "That is awesome! Let's schedule a call on Convo soon to detail our next release."
+        }
+    }
+
+    // --- CALLS HANDLING ENGINE ---
+
+    fun startCall(contact: Contact, isVideo: Boolean) {
+        // Stop any running calls
+        resetCallEngine()
+
+        _callState.value = CallState.Ringing(
+            contact = contact,
+            isOutgoing = true,
+            callType = if (isVideo) "Video" else "Audio"
+        )
+
+        // Firebase real-time signaling
+        if (contact.firebaseUid.isNotEmpty() && com.example.data.firebase.FirebaseManager.isFirebaseAvailable) {
+            viewModelScope.launch {
+                activeFirebaseCallId = com.example.data.firebase.FirebaseManager.startCall(contact.firebaseUid, if (isVideo) "Video" else "Audio")
+            }
+        }
+
+        // Automatically connect call after 5 seconds of "ringing" simulation if offline
+        ringTimeoutJob = viewModelScope.launch {
+            delay(5000)
+            if (activeFirebaseCallId == null) {
+                connectCall(contact, if (isVideo) "Video" else "Audio")
+            }
+        }
+    }
+
+    fun receiveIncomingCallSimulated(contact: Contact, isVideo: Boolean) {
+        resetCallEngine()
+
+        _callState.value = CallState.Ringing(
+            contact = contact,
+            isOutgoing = false,
+            callType = if (isVideo) "Video" else "Audio"
+        )
+    }
+
+    fun acceptCall() {
+        val current = _callState.value
+        if (current is CallState.Ringing) {
+            ringTimeoutJob?.cancel()
+            
+            // Accept on Firebase
+            if (activeFirebaseCallId != null && current.contact.firebaseUid.isNotEmpty()) {
+                viewModelScope.launch {
+                    com.example.data.firebase.FirebaseManager.acceptCall(current.contact.firebaseUid, activeFirebaseCallId!!)
+                }
+            }
+
+            connectCall(current.contact, current.callType)
+        }
+    }
+
+    fun declineOrCancelCall() {
+        val current = _callState.value
+        if (current is CallState.Ringing) {
+            ringTimeoutJob?.cancel()
+            
+            // Decline on firebase
+            if (activeFirebaseCallId != null && current.contact.firebaseUid.isNotEmpty()) {
+                viewModelScope.launch {
+                    com.example.data.firebase.FirebaseManager.endCall(current.contact.firebaseUid, activeFirebaseCallId!!)
+                }
+            }
+
+            // Log missed call if incoming, cancelled if outgoing
+            viewModelScope.launch {
+                val direction = if (current.isOutgoing) "Outgoing" else "Missed"
+                repository.insertCallLog(
+                    CallLog(
+                        contactId = current.contact.id,
+                        direction = direction,
+                        type = current.callType,
+                        timestamp = System.currentTimeMillis(),
+                        durationSeconds = 0
+                    )
+                )
+                // Insert a system cancellation log message in their chat
+                repository.insertMessage(
+                    Message(
+                        contactId = current.contact.id,
+                        content = if (current.isOutgoing) "Cancelled ${current.callType.lowercase()} call" else "Missed ${current.callType.lowercase()} call",
+                        timestamp = System.currentTimeMillis(),
+                        isFromMe = current.isOutgoing,
+                        type = if (current.callType == "Video") "VideoCall" else "AudioCall",
+                        durationSeconds = 0
+                    )
+                )
+            }
+        }
+        resetCallEngine()
+    }
+
+    private fun connectCall(contact: Contact, callType: String) {
+        _callState.value = CallState.Connected(
+            contact = contact,
+            callType = callType,
+            durationSeconds = 0
+        )
+
+        // Start duration counter incrementing every second
+        callTimerJob = viewModelScope.launch {
+            while (true) {
+                delay(1000)
+                val current = _callState.value
+                if (current is CallState.Connected) {
+                    _callState.value = current.copy(durationSeconds = current.durationSeconds + 1)
+                } else {
+                    break
+                }
+            }
+        }
+    }
+
+    fun endCall() {
+        val current = _callState.value
+        if (current is CallState.Connected) {
+            val duration = current.durationSeconds
+            
+            // Hangup on Firebase
+            if (activeFirebaseCallId != null && current.contact.firebaseUid.isNotEmpty()) {
+                viewModelScope.launch {
+                    com.example.data.firebase.FirebaseManager.endCall(current.contact.firebaseUid, activeFirebaseCallId!!)
+                }
+            }
+
+            viewModelScope.launch {
+                // Log the completed call
+                repository.insertCallLog(
+                    CallLog(
+                        contactId = current.contact.id,
+                        direction = "Outgoing", // outgoing log simulation
+                        type = current.callType,
+                        timestamp = System.currentTimeMillis(),
+                        durationSeconds = duration
+                    )
+                )
+
+                // Add call completion to the chat system messaging history!
+                val minutesStr = "%02d:%02d".format(duration / 60, duration % 60)
+                repository.insertMessage(
+                    Message(
+                        contactId = current.contact.id,
+                        content = "${current.callType} call ended • $minutesStr",
+                        timestamp = System.currentTimeMillis(),
+                        isFromMe = true,
+                        type = if (current.callType == "Video") "VideoCall" else "AudioCall",
+                        durationSeconds = duration
+                    )
+                )
+            }
+        }
+        resetCallEngine()
+    }
+
+    // Call settings modifiers in connected mode
+    fun toggleMute() {
+        val current = _callState.value
+        if (current is CallState.Connected) {
+            _callState.value = current.copy(isMuted = !current.isMuted)
+        }
+    }
+
+    fun toggleSpeaker() {
+        val current = _callState.value
+        if (current is CallState.Connected) {
+            _callState.value = current.copy(isSpeakerOn = !current.isSpeakerOn)
+        }
+    }
+
+    fun toggleCamera() {
+        val current = _callState.value
+        if (current is CallState.Connected && current.callType == "Video") {
+            _callState.value = current.copy(isCamOn = !current.isCamOn)
+        }
+    }
+
+    fun setVideoFilter(filter: String) {
+        val current = _callState.value
+        if (current is CallState.Connected && current.callType == "Video") {
+            _callState.value = current.copy(selectedFilter = filter)
+        }
+    }
+
+    private fun resetCallEngine() {
+        callTimerJob?.cancel()
+        callTimerJob = null
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = null
+        _callState.value = CallState.Idle
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        activeMessageListener?.remove()
+        activeMessageListener = null
+        resetCallEngine()
+    }
+}
