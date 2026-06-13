@@ -36,10 +36,20 @@ class MainActivity : ComponentActivity() {
     super.onCreate(savedInstanceState)
     appContext = this.applicationContext
 
+    val permissionsToRequest = mutableListOf(
+        Manifest.permission.CAMERA,
+        Manifest.permission.RECORD_AUDIO
+    )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
-        }
+        permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    val missingPermissions = permissionsToRequest.filter {
+        ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+    }
+
+    if (missingPermissions.isNotEmpty()) {
+        ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 101)
     }
 
     enableEdgeToEdge()

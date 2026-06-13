@@ -33,6 +33,12 @@ import org.webrtc.EglBase
 import com.example.ui.viewmodel.CallState
 import com.example.ui.viewmodel.ChatViewModel
 import kotlinx.coroutines.delay
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
+import kotlin.math.roundToInt
 
 @Composable
 fun CallUiScreen(
@@ -433,113 +439,347 @@ fun VideoCallLayout(
     state: CallState.Connected,
     viewModel: ChatViewModel
 ) {
-    // Generate beautiful color backgrounds depending on chosen video filter simulation!
-    val filterColor = when (state.selectedFilter) {
-        "Cinematic" -> Color(0xE7D4B6) // Warm gold
-        "Sepia" -> Color(0x99AFA189) // Earth dust sepia
-        "Vibrant" -> Color(0x3BFF00D4) // Radiant neon electric magenta
-        "Noir" -> Color(0xCC000000) // Pure High Contrast black/white grayscale
-        else -> Color.Transparent
+    // State to swap full-screen and PiP videos
+    var isSwapped by remember { mutableStateOf(false) }
+
+    // Screen and PiP dimension sizes for coordinate constraint calculations
+    var parentSize by remember { mutableStateOf(IntSize.Zero) }
+    var pipSize by remember { mutableStateOf(IntSize.Zero) }
+
+    // Coordinates of the floating window
+    var offsetX by remember { mutableStateOf(0f) }
+    var offsetY by remember { mutableStateOf(0f) }
+
+    // Snap target positions
+    val animatedOffsetX by animateFloatAsState(
+        targetValue = offsetX,
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessLow)
+    )
+    val animatedOffsetY by animateFloatAsState(
+        targetValue = offsetY,
+        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessLow)
+    )
+
+    // Position PiP automatically to bottom-right corner when parent and child measurements are complete
+    LaunchedEffect(parentSize, pipSize) {
+        if (parentSize != IntSize.Zero && pipSize != IntSize.Zero && offsetX == 0f && offsetY == 0f) {
+            // Default position: Bottom Right corner with margins (respecting control panels insets)
+            offsetX = parentSize.width - pipSize.width - 48f
+            offsetY = parentSize.height - pipSize.height - 340f
+        }
     }
 
+    // Filter backdrop simulation overlay
+    val filterColor = when (state.selectedFilter) {
+        "Cinematic" -> Color(0xE7D4B6).copy(alpha = 0.18f) // Warm cinematic gold
+        "Sepia" -> Color(0x99AFA189).copy(alpha = 0.15f) // Earthy sepia tone
+        "Vibrant" -> Color(0x3BFF00D4).copy(alpha = 0.15f) // Neon pink glow
+        "Noir" -> Color(0xCC000000).copy(alpha = 0.35f) // Moody monochrome grayscale
+        else -> Color.Transparent
+    }
     val animatedFilterColor by animateColorAsState(targetValue = filterColor, animationSpec = tween(500))
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        // remote participant
-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-            // WEBRTC REMOTE SURFACE RENDERER
-            AndroidView(
-                factory = { ctx ->
-                    SurfaceViewRenderer(ctx).apply {
-                        init(EglBase.create().eglBaseContext, null)
-                        setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                        setEnableHardwareScaler(true)
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { parentSize = it }
+            .background(Color(0xFF0D0E11))
+    ) {
+        // --------------------------------------------------------------------
+        // 1. FULLSCREEN MAIN VIDEO STREAM
+        // --------------------------------------------------------------------
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable {
+                    // Tap on background controls layout
+                }
+        ) {
+            // Determine what is currently full-screen
+            val isMainLocal = isSwapped
+            
+            if (isMainLocal) {
+                // If local stream is shown full-screen, respect camera state
+                if (state.isCamOn) {
+                    AndroidView(
+                        factory = { ctx ->
+                            SurfaceViewRenderer(ctx).apply {
+                                init(viewModel.rootEglBaseContext, null)
+                                setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                                setEnableHardwareScaler(true)
+                                setMirror(true) // local camera feels natural mirrored
+                                viewModel.attachLocalRenderer(this)
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    // Camera is off, show beautiful centered full screen avatar screen
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color(0xFF15171C)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(
+                                modifier = Modifier
+                                    .size(120.dp)
+                                    .border(2.dp, ConvoColors.ElectricBlue.copy(alpha = 0.4f), CircleShape)
+                                    .padding(4.dp)
+                            ) {
+                                ContactAvatar(contact = state.contact, size = 110.dp, showStatusBadge = false)
+                            }
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "Your Camera is Off",
+                                color = Color.White.copy(alpha = 0.8f),
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
+                }
+            } else {
+                // Default: Remote stream is full-screen
+                AndroidView(
+                    factory = { ctx ->
+                        SurfaceViewRenderer(ctx).apply {
+                            init(viewModel.rootEglBaseContext, null)
+                            setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                            setEnableHardwareScaler(true)
+                            viewModel.attachRemoteRenderer(this)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            // Apply filter overlay matching active chosen option
+            if (state.selectedFilter != "Normal") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(animatedFilterColor)
+                )
+            }
         }
 
-        // Pinned Header statistics overlay
+        // --------------------------------------------------------------------
+        // 2. PINNED HEADER STATISTICS OVERLAY
+        // --------------------------------------------------------------------
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 24.dp),
+                .statusBarsPadding()
+                .padding(horizontal = 24.dp, vertical = 20.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.Top
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(
+                modifier = Modifier
+                    .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
                 Text(
-                    text = state.contact.name,
+                    text = if (isSwapped) "Your View" else state.contact.name,
                     color = Color.White,
-                    fontSize = 20.sp,
+                    fontSize = 18.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
                     text = "Connected • ${formatDuration(state.durationSeconds)}",
                     color = ConvoColors.AccentMint,
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
             }
 
-            // Status Badge pill
-            Box(
+            // Status Badge Pill with pulsing visual indicator
+            val infiniteTransition = rememberInfiniteTransition()
+            val pulseAlpha by infiniteTransition.animateFloat(
+                initialValue = 0.4f,
+                targetValue = 1.0f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(1000, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse
+                )
+            )
+
+            Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.Black.copy(alpha = 0.5f))
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .graphicsLayer(alpha = pulseAlpha)
+                        .clip(CircleShape)
+                        .background(ConvoColors.AccentMint)
+                )
                 Text(
-                    text = "LIVE • HD",
-                    color = ConvoColors.ActiveVibe,
-                    fontSize = 11.sp,
+                    text = "P2P STABLE • HD",
+                    color = Color.White,
+                    fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.sp
+                    letterSpacing = 0.5.sp
                 )
             }
         }
 
-        // Local Video (PiP)
+        // --------------------------------------------------------------------
+        // 3. FLAGGED PORTRAIT FLOATING PiP VIDEO WINDOW
+        // --------------------------------------------------------------------
         Box(
             modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(bottom = 140.dp, end = 20.dp)
-                .width(100.dp)
-                .height(150.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color.Black.copy(alpha = 0.72f))
-                .border(2.dp, ConvoColors.ElectricBlue, RoundedCornerShape(12.dp)),
+                .onSizeChanged { pipSize = it }
+                .offset {
+                    IntOffset(
+                        animatedOffsetX.roundToInt(),
+                        animatedOffsetY.roundToInt()
+                    )
+                }
+                .width(115.dp)
+                .height(175.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(Color.Black.copy(alpha = 0.85f))
+                .border(2.dp, Color.White.copy(alpha = 0.35f), RoundedCornerShape(18.dp))
+                // Add double-border for high-end look
+                .border(4.dp, Color.Black.copy(alpha = 0.1f), RoundedCornerShape(18.dp))
+                .pointerInput(parentSize, pipSize) {
+                    detectDragGestures(
+                        onDragEnd = {
+                            if (parentSize == IntSize.Zero || pipSize == IntSize.Zero) return@detectDragGestures
+
+                            // Target horizontal snap guides
+                            val leftSnap = 24f
+                            val rightSnap = parentSize.width - pipSize.width - 24f
+                            
+                            // Target vertical snap guides
+                            val topSnap = 100f
+                            val bottomSnap = parentSize.height - pipSize.height - 340f
+
+                            val midX = (leftSnap + rightSnap) / 2
+                            val midY = (topSnap + bottomSnap) / 2
+
+                            // Magnet snap to nearest of the 4 bounds smoothly
+                            val targetX = if (offsetX < midX) leftSnap else rightSnap
+                            val targetY = if (offsetY < midY) topSnap else bottomSnap
+
+                            offsetX = targetX
+                            offsetY = targetY
+                        },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            offsetX += dragAmount.x
+                            offsetY += dragAmount.y
+
+                            if (parentSize != IntSize.Zero && pipSize != IntSize.Zero) {
+                                // Constrain drag dimensions so it cannot be launched entirely off screen
+                                val maxX = parentSize.width - pipSize.width - 12f
+                                val maxY = parentSize.height - pipSize.height - 180f
+                                offsetX = offsetX.coerceIn(12f, maxX)
+                                offsetY = offsetY.coerceIn(40f, maxY)
+                            }
+                        }
+                    )
+                }
+                .clickable {
+                    // Tap to swap full screen layouts!
+                    isSwapped = !isSwapped
+                },
             contentAlignment = Alignment.Center
         ) {
-            if (state.isCamOn) {
-                 // WEBRTC LOCAL SURFACE RENDERER
-                 AndroidView(
+            val isPipLocal = !isSwapped
+
+            if (isPipLocal) {
+                // If local camera is on, render it inside PiP
+                if (state.isCamOn) {
+                    AndroidView(
+                        factory = { ctx ->
+                            SurfaceViewRenderer(ctx).apply {
+                                init(viewModel.rootEglBaseContext, null)
+                                setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                                setEnableHardwareScaler(true)
+                                setMirror(true)
+                                viewModel.attachLocalRenderer(this)
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    // Camera off layout within PiP frame
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color(0xFF1E2129)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.VideocamOff,
+                                contentDescription = "Camera Off",
+                                tint = Color.Red,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Camera Off",
+                                color = Color.White.copy(alpha = 0.6f),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            } else {
+                // Render remote feedback stream inside PiP frame
+                AndroidView(
                     factory = { ctx ->
                         SurfaceViewRenderer(ctx).apply {
-                            init(EglBase.create().eglBaseContext, null)
+                            init(viewModel.rootEglBaseContext, null)
                             setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
                             setEnableHardwareScaler(true)
-                            setMirror(true)
+                            viewModel.attachRemoteRenderer(this)
                         }
                     },
                     modifier = Modifier.fillMaxSize()
                 )
-            } else {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            }
+
+            // Overlay label to let the user know they can click to swap
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .padding(vertical = 4.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
                     Icon(
-                        imageVector = Icons.Default.VideocamOff,
-                        contentDescription = "Camera Off",
-                        tint = Color.Red,
-                        modifier = Modifier.size(24.dp)
+                        imageVector = Icons.Default.Sync,
+                        contentDescription = "Swap",
+                        tint = Color.White.copy(alpha = 0.8f),
+                        modifier = Modifier.size(10.dp)
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Camera Off",
-                        color = Color.Red,
-                        fontSize = 9.sp,
+                        text = "TAP TO SWAP",
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 8.sp,
                         fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center
+                        letterSpacing = 0.5.sp
                     )
                 }
             }

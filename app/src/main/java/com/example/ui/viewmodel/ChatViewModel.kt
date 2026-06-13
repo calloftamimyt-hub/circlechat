@@ -1,6 +1,7 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.model.CallLog
@@ -11,6 +12,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import org.webrtc.*
 
 sealed interface CallState {
     object Idle : CallState
@@ -90,6 +92,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val isFirebaseLibraryInitialized: Boolean
         get() = com.example.data.firebase.FirebaseManager.isFirebaseAvailable
 
+    // Ringtone sound system
+    private val soundPlayer = CallSoundPlayer(application)
+
+    // WebRTC Core components
+    val rootEglBaseContext: EglBase.Context = EglBase.create().eglBaseContext
+    private var peerConnectionFactory: PeerConnectionFactory? = null
+    private var localVideoSource: VideoSource? = null
+    internal var localVideoTrack: VideoTrack? = null
+    private var videoCapturer: CameraVideoCapturer? = null
+    private var surfaceTextureHelper: SurfaceTextureHelper? = null
+
+    private var attachedLocalRenderer: SurfaceViewRenderer? = null
+    private var attachedRemoteRenderer: SurfaceViewRenderer? = null
+
     // For call timers
     private var callTimerJob: Job? = null
     private var ringTimeoutJob: Job? = null
@@ -129,6 +145,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         isOutgoing = false,
                         callType = type
                     )
+                    // Ring on incoming call
+                    soundPlayer.startRinging()
                 }
             }
         }
@@ -311,6 +329,97 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- CALLS HANDLING ENGINE ---
 
+    private fun initWebRtc() {
+        if (peerConnectionFactory != null) return
+        try {
+            val context = getApplication<Application>().applicationContext
+            PeerConnectionFactory.initialize(
+                PeerConnectionFactory.InitializationOptions.builder(context)
+                    .setEnableInternalTracer(true)
+                    .createInitializationOptions()
+            )
+            val options = PeerConnectionFactory.Options()
+            peerConnectionFactory = PeerConnectionFactory.builder()
+                .setOptions(options)
+                .createPeerConnectionFactory()
+        } catch (e: Exception) {
+            Log.e("ChatViewModel", "Error initializing PeerConnectionFactory", e)
+        }
+    }
+
+    fun startCameraCapture() {
+        initWebRtc()
+        val context = getApplication<Application>().applicationContext
+        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Log.w("ChatViewModel", "Camera permission is NOT granted, skipping WebRTC capture")
+            return
+        }
+        if (videoCapturer != null) return
+
+        try {
+            surfaceTextureHelper = SurfaceTextureHelper.create("WebRtcCaptureThread", rootEglBaseContext)
+            
+            val enumerator = Camera2Enumerator(context)
+            val deviceNames = enumerator.deviceNames
+            var frontCamera: String? = null
+            for (name in deviceNames) {
+                if (enumerator.isFrontFacing(name)) {
+                    frontCamera = name
+                    break
+                }
+            }
+            if (frontCamera == null && deviceNames.isNotEmpty()) {
+                frontCamera = deviceNames[0]
+            }
+
+            if (frontCamera != null) {
+                videoCapturer = enumerator.createCapturer(frontCamera, null)
+                localVideoSource = peerConnectionFactory?.createVideoSource(videoCapturer!!.isScreencast)
+                videoCapturer?.initialize(surfaceTextureHelper, context, localVideoSource?.capturerObserver)
+                
+                localVideoTrack = peerConnectionFactory?.createVideoTrack("100", localVideoSource)
+                videoCapturer?.startCapture(640, 480, 30)
+                
+                // If view finders are waiting, immediately attach them
+                attachedLocalRenderer?.let { localVideoTrack?.addSink(it) }
+                attachedRemoteRenderer?.let { localVideoTrack?.addSink(it) }
+            }
+        } catch (e: Exception) {
+            Log.e("ChatViewModel", "Error starting camera capture for WebRTC", e)
+        }
+    }
+
+    fun stopCameraCapture() {
+        try {
+            attachedLocalRenderer?.let { localVideoTrack?.removeSink(it) }
+            attachedRemoteRenderer?.let { localVideoTrack?.removeSink(it) }
+            attachedLocalRenderer = null
+            attachedRemoteRenderer = null
+
+            videoCapturer?.stopCapture()
+            videoCapturer?.dispose()
+            videoCapturer = null
+
+            surfaceTextureHelper?.dispose()
+            surfaceTextureHelper = null
+
+            localVideoSource?.dispose()
+            localVideoSource = null
+        } catch (e: Exception) {
+            Log.e("ChatViewModel", "Error stopping camera capture", e)
+        }
+    }
+
+    fun attachLocalRenderer(renderer: SurfaceViewRenderer) {
+        attachedLocalRenderer = renderer
+        localVideoTrack?.addSink(renderer)
+    }
+
+    fun attachRemoteRenderer(renderer: SurfaceViewRenderer) {
+        attachedRemoteRenderer = renderer
+        localVideoTrack?.addSink(renderer)
+    }
+
     fun startCall(contact: Contact, isVideo: Boolean) {
         // Stop any running calls
         resetCallEngine()
@@ -320,6 +429,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isOutgoing = true,
             callType = if (isVideo) "Video" else "Audio"
         )
+        // Play outgoing calling sound dialback
+        soundPlayer.startCallingSound()
 
         // Firebase real-time signaling
         if (contact.firebaseUid.isNotEmpty() && com.example.data.firebase.FirebaseManager.isFirebaseAvailable) {
@@ -345,6 +456,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isOutgoing = false,
             callType = if (isVideo) "Video" else "Audio"
         )
+        // Play incoming ringtone sound
+        soundPlayer.startRinging()
     }
 
     fun acceptCall() {
@@ -404,11 +517,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun connectCall(contact: Contact, callType: String) {
+        soundPlayer.stop() // stop ringtone loops immediately
+
         _callState.value = CallState.Connected(
             contact = contact,
             callType = callType,
             durationSeconds = 0
         )
+
+        if (callType == "Video") {
+            startCameraCapture()
+        }
 
         // Start duration counter incrementing every second
         callTimerJob = viewModelScope.launch {
@@ -483,7 +602,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleCamera() {
         val current = _callState.value
         if (current is CallState.Connected && current.callType == "Video") {
-            _callState.value = current.copy(isCamOn = !current.isCamOn)
+            val nextCam = !current.isCamOn
+            _callState.value = current.copy(isCamOn = nextCam)
+            if (nextCam) {
+                startCameraCapture()
+            } else {
+                stopCameraCapture()
+            }
         }
     }
 
@@ -495,6 +620,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun resetCallEngine() {
+        soundPlayer.stop() // stop any audio loops
+        stopCameraCapture() // stop camera capture
+
         callTimerJob?.cancel()
         callTimerJob = null
         ringTimeoutJob?.cancel()
